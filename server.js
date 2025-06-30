@@ -1,17 +1,26 @@
-// server.js - Updated for AWS S3 Storage
+// server.js - Updated for AWS SDK v3 and S3 Storage
 const express = require('express');
 const multer = require('multer');
-const AWS = require('aws-sdk');
+const { 
+  S3Client, 
+  HeadBucketCommand, 
+  PutObjectCommand, 
+  GetObjectCommand, 
+  ListObjectsV2Command, 
+  DeleteObjectCommand 
+} = require('@aws-sdk/client-s3');
 const crypto = require('crypto');
 const cors = require('cors');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Configure AWS S3
-const s3 = new AWS.S3({
-  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+// Configure AWS S3 Client
+const s3Client = new S3Client({
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  },
   region: process.env.AWS_REGION || 'us-east-1'
 });
 
@@ -22,17 +31,16 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// Configure multer for memory storage (since we're uploading to S3)
 const storage = multer.memoryStorage();
 const upload = multer({ 
   storage: storage,
-  limits: { fileSize: 50 * 1024 * 1024 } // 50MB limit
+  limits: { fileSize: 50 * 1024 * 1024 } 
 });
 
 // Health check endpoint
 app.get('/', (req, res) => {
   res.json({ 
-    status: 'PDF Storage Server Running on AWS S3',
+    status: 'PDF Storage Server Running on AWS S3 (SDK v3)',
     timestamp: new Date().toISOString(),
     bucket: BUCKET_NAME
   });
@@ -41,7 +49,8 @@ app.get('/', (req, res) => {
 // Test S3 connection
 app.get('/test-s3', async (req, res) => {
   try {
-    await s3.headBucket({ Bucket: BUCKET_NAME }).promise();
+    const command = new HeadBucketCommand({ Bucket: BUCKET_NAME });
+    await s3Client.send(command);
     res.json({ status: 'S3 connection successful', bucket: BUCKET_NAME });
   } catch (error) {
     res.status(500).json({ 
@@ -75,27 +84,27 @@ app.post('/upload-pdf', upload.single('pdf'), async (req, res) => {
     };
 
     // Upload PDF to S3
-    const pdfUploadParams = {
+    const pdfUploadCommand = new PutObjectCommand({
       Bucket: BUCKET_NAME,
       Key: pdfKey,
       Body: req.file.buffer,
       ContentType: 'application/pdf',
       ContentDisposition: `inline; filename="${metadata.originalName}"`,
       CacheControl: 'public, max-age=31536000' // Cache for 1 year
-    };
+    });
 
     // Upload metadata to S3
-    const metadataUploadParams = {
+    const metadataUploadCommand = new PutObjectCommand({
       Bucket: BUCKET_NAME,
       Key: metadataKey,
       Body: JSON.stringify(metadata, null, 2),
       ContentType: 'application/json'
-    };
+    });
 
     // Perform both uploads
     await Promise.all([
-      s3.upload(pdfUploadParams).promise(),
-      s3.upload(metadataUploadParams).promise()
+      s3Client.send(pdfUploadCommand),
+      s3Client.send(metadataUploadCommand)
     ]);
 
     // Create public URL
@@ -143,27 +152,27 @@ app.post('/upload-pdf-base64', async (req, res) => {
     };
 
     // Upload PDF to S3
-    const pdfUploadParams = {
+    const pdfUploadCommand = new PutObjectCommand({
       Bucket: BUCKET_NAME,
       Key: pdfKey,
       Body: buffer,
       ContentType: 'application/pdf',
       ContentDisposition: `inline; filename="${metadata.originalName}"`,
       CacheControl: 'public, max-age=31536000'
-    };
+    });
 
     // Upload metadata to S3
-    const metadataUploadParams = {
+    const metadataUploadCommand = new PutObjectCommand({
       Bucket: BUCKET_NAME,
       Key: metadataKey,
       Body: JSON.stringify(metadata, null, 2),
       ContentType: 'application/json'
-    };
+    });
 
     // Perform both uploads
     await Promise.all([
-      s3.upload(pdfUploadParams).promise(),
-      s3.upload(metadataUploadParams).promise()
+      s3Client.send(pdfUploadCommand),
+      s3Client.send(metadataUploadCommand)
     ]);
 
     // Create public URL
@@ -190,43 +199,49 @@ app.get('/pdf/:id', async (req, res) => {
     const metadataKey = `metadata/${id}.json`;
 
     // Get PDF from S3
-    const pdfParams = {
+    const pdfCommand = new GetObjectCommand({
       Bucket: BUCKET_NAME,
       Key: pdfKey
-    };
+    });
 
     // Check if PDF exists and get it
-    const pdfObject = await s3.getObject(pdfParams).promise();
+    const pdfObject = await s3Client.send(pdfCommand);
 
     // Try to get metadata for filename
     let filename = 'document.pdf';
     try {
-      const metadataParams = {
+      const metadataCommand = new GetObjectCommand({
         Bucket: BUCKET_NAME,
         Key: metadataKey
-      };
-      const metadataObject = await s3.getObject(metadataParams).promise();
-      const metadata = JSON.parse(metadataObject.Body.toString());
+      });
+      const metadataObject = await s3Client.send(metadataCommand);
+      
+      // Convert stream to string for v3
+      const metadataBody = await streamToString(metadataObject.Body);
+      const metadata = JSON.parse(metadataBody);
       filename = metadata.originalName || 'document.pdf';
     } catch (metadataError) {
       console.log('No metadata found, using default filename');
     }
+
+    // Convert stream to buffer for v3
+    const pdfBuffer = await streamToBuffer(pdfObject.Body);
 
     // Set proper headers
     res.set({
       'Content-Type': 'application/pdf',
       'Content-Disposition': `inline; filename="${filename}"`,
       'Cache-Control': 'public, max-age=31536000',
-      'Content-Length': pdfObject.Body.length
+      'Content-Length': pdfBuffer.length
     });
 
     // Send the PDF
-    res.send(pdfObject.Body);
+    res.send(pdfBuffer);
 
   } catch (error) {
     console.error('Serve PDF error:', error);
     
-    if (error.code === 'NoSuchKey') {
+    if (error.name === 'NoSuchKey') {
       return res.status(404).json({ error: 'PDF not found' });
     }
     
@@ -240,20 +255,23 @@ app.get('/pdf/:id/info', async (req, res) => {
     const { id } = req.params;
     const metadataKey = `metadata/${id}.json`;
 
-    const params = {
+    const command = new GetObjectCommand({
       Bucket: BUCKET_NAME,
       Key: metadataKey
-    };
+    });
 
-    const object = await s3.getObject(params).promise();
-    const metadata = JSON.parse(object.Body.toString());
+    const object = await s3Client.send(command);
+    
+    // Convert stream to string for v3
+    const metadataBody = await streamToString(object.Body);
+    const metadata = JSON.parse(metadataBody);
     
     res.json(metadata);
 
   } catch (error) {
     console.error('Metadata error:', error);
     
-    if (error.code === 'NoSuchKey') {
+    if (error.name === 'NoSuchKey') {
       return res.status(404).json({ error: 'PDF metadata not found' });
     }
     
@@ -261,26 +279,28 @@ app.get('/pdf/:id/info', async (req, res) => {
   }
 });
 
-// List all PDFs (optional admin endpoint)
+// List all PDFs 
 app.get('/admin/pdfs', async (req, res) => {
   try {
-    const params = {
+    const command = new ListObjectsV2Command({
       Bucket: BUCKET_NAME,
       Prefix: 'metadata/',
       MaxKeys: 1000
-    };
+    });
 
-    const objects = await s3.listObjectsV2(params).promise();
+    const objects = await s3Client.send(command);
     
     const pdfs = await Promise.all(
-      objects.Contents.map(async (object) => {
+      (objects.Contents || []).map(async (object) => {
         try {
-          const getParams = {
+          const getCommand = new GetObjectCommand({
             Bucket: BUCKET_NAME,
             Key: object.Key
-          };
-          const metadataObject = await s3.getObject(getParams).promise();
-          const metadata = JSON.parse(metadataObject.Body.toString());
+          });
+          const metadataObject = await s3Client.send(getCommand);
+          
+          const metadataBody = await streamToString(metadataObject.Body);
+          const metadata = JSON.parse(metadataBody);
           
           return {
             ...metadata,
@@ -306,7 +326,6 @@ app.get('/admin/pdfs', async (req, res) => {
   }
 });
 
-// Delete PDF (optional admin endpoint)
 app.delete('/admin/pdf/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -314,10 +333,12 @@ app.delete('/admin/pdf/:id', async (req, res) => {
     const metadataKey = `metadata/${id}.json`;
 
     // Delete both PDF and metadata
-    await Promise.all([
-      s3.deleteObject({ Bucket: BUCKET_NAME, Key: pdfKey }).promise(),
-      s3.deleteObject({ Bucket: BUCKET_NAME, Key: metadataKey }).promise()
-    ]);
+    const deleteCommands = [
+      new DeleteObjectCommand({ Bucket: BUCKET_NAME, Key: pdfKey }),
+      new DeleteObjectCommand({ Bucket: BUCKET_NAME, Key: metadataKey })
+    ];
+
+    await Promise.all(deleteCommands.map(command => s3Client.send(command)));
 
     res.json({ success: true, message: 'PDF deleted successfully', id });
 
@@ -326,6 +347,20 @@ app.delete('/admin/pdf/:id', async (req, res) => {
     res.status(500).json({ error: 'Failed to delete PDF', details: error.message });
   }
 });
+
+// Helper functions for AWS SDK v3 stream handling
+async function streamToBuffer(stream) {
+  const chunks = [];
+  for await (const chunk of stream) {
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+async function streamToString(stream) {
+  const buffer = await streamToBuffer(stream);
+  return buffer.toString('utf-8');
+}
 
 // Error handling middleware
 app.use((error, req, res, next) => {
